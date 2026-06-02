@@ -1,0 +1,24 @@
+{
+    "general": {
+        "max_threads": 50,
+        "timeout": 3,
+        "output_dir": "reports/",
+        "user_agent": "AutoRecon-X/1.0 (Security Assessment)"
+    },
+    "api_keys": {
+        "gemini": "YOUR_GEMINI_API_KEY_HERE",
+        "shodan": "",
+        "virustotal": ""
+    },
+    "scan_settings": {
+        "port_range": "1-1024",
+        "run_crawler": true,
+        "run_ai": true,
+        "evasion_level": "standard"
+    },
+    "notifications": {
+        "enable_email": false,
+        "email_to": "security@example.com",
+        "discord_webhook": ""
+    }
+}
